@@ -1,52 +1,81 @@
+import argparse
 import os
 import re
 import sys
+from collections import defaultdict
+
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 
-RESULTS_DIR = "locust-results"
-OUTPUT_DIR  = "graphs"
-SCENARIOS   = ["img-150kb", "text-400kb", "img-300kb"]
-INSTANCES   = [1, 2, 3]
-USERS       = [10, 100, 1000]
-PATTERN     = re.compile(r"^(\d+)inst-(\d+)users-(.+)_stats\.csv$")
-
-COLORS_INST = {1: "#4C72B0", 2: "#DD8452", 3: "#55A868"}
-COLORS_USER = {10: "#4C72B0", 100: "#DD8452", 1000: "#55A868"}
+PATTERN = re.compile(r"^(\d+)inst-(\d+)users-(.+)_stats\.csv$")
 
 
-def load_data():
-    if not os.path.isdir(RESULTS_DIR):
-        sys.exit(f"Diretório não encontrado: {RESULTS_DIR}")
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--dir", default="locust-results", help="pasta com os CSVs")
+    p.add_argument("--out", default="graphs", help="pasta de saida")
+    p.add_argument("--log", action="store_true", help="eixo Y em escala log")
+    p.add_argument("--line", action="store_true", help="tempo de resposta em linha")
+    p.add_argument("--dpi", type=int, default=150)
+    return p.parse_args()
+
+
+def discover(results_dir):
+    """Escaneia CSVs e devolve dict {(inst, users, scenario): metrics}."""
+    if not os.path.isdir(results_dir):
+        sys.exit(f"Diretorio nao encontrado: {results_dir}")
+
     data = {}
-    for fname in sorted(os.listdir(RESULTS_DIR)):
+    scenarios, instances, users = set(), set(), set()
+
+    for fname in sorted(os.listdir(results_dir)):
         m = PATTERN.match(fname)
         if not m:
             continue
-        inst, users, scenario = int(m.group(1)), int(m.group(2)), m.group(3)
+        inst, usr, scen = int(m.group(1)), int(m.group(2)), m.group(3)
+        path = os.path.join(results_dir, fname)
         try:
-            df = pd.read_csv(os.path.join(RESULTS_DIR, fname))
+            df = pd.read_csv(path)
         except Exception as e:
             print(f"[skip] {fname}: {e}")
             continue
+
         agg = df[df["Name"].astype(str).str.strip() == "Aggregated"]
         if agg.empty:
             agg = df.tail(1)
         if agg.empty:
+            print(f"[skip] {fname}: sem linhas")
             continue
+
         row = agg.iloc[0]
-        requests = int(row["Request Count"])
-        if requests == 0:
-            print(f"[aviso] {fname}: 0 requisições (teste falhou?) - ponto omitido")
+        reqs = int(row.get("Request Count", 0))
+        if reqs == 0:
+            print(f"[skip] {fname}: 0 requests")
             continue
-        data[(inst, users, scenario)] = {
+
+        data[(inst, usr, scen)] = {
             "avg_ms":   float(row["Average Response Time"]),
+            "median":   float(row.get("Median Response Time", np.nan)),
+            "p95":      float(row.get("95%", np.nan)),
+            "p99":      float(row.get("99%", np.nan)),
             "rps":      float(row["Requests/s"]),
-            "requests": requests,
-            "failures": int(row["Failure Count"]),
+            "requests": reqs,
+            "failures": int(row.get("Failure Count", 0)),
         }
-    return data
+        scenarios.add(scen)
+        instances.add(inst)
+        users.add(usr)
+
+    return data, sorted(scenarios), sorted(instances), sorted(users)
+
+
+def auto_scale(values):
+    """Sugere 'log' se a razao max/min passar de 20x."""
+    vals = [v for v in values if not np.isnan(v) and v > 0]
+    if len(vals) < 2:
+        return "linear"
+    return "log" if max(vals) / min(vals) > 20 else "linear"
 
 
 def annotate(ax, bars, values, fmt="{:.0f}"):
@@ -59,82 +88,183 @@ def annotate(ax, bars, values, fmt="{:.0f}"):
                     ha="center", va="bottom", fontsize=8)
 
 
-def chart_response_time(data):
-    """X = usuários, barras por instância, Y = tempo de resposta médio."""
-    fig, axes = plt.subplots(1, len(SCENARIOS), figsize=(18, 5), sharey=True)
-    width = 0.25
-    x = np.arange(len(USERS))
-    for ax, scenario in zip(axes, SCENARIOS):
-        for i, inst in enumerate(INSTANCES):
-            vals = [data.get((inst, u, scenario), {}).get("avg_ms", np.nan) for u in USERS]
-            offset = (i - (len(INSTANCES) - 1) / 2) * width
+def get_colors(keys):
+    cmap = plt.get_cmap("tab10")
+    return {k: cmap(i % 10) for i, k in enumerate(keys)}
+
+
+def chart_response_time(data, scenarios, instances, users,
+                        out_path, use_log=False, use_line=False):
+    n = len(scenarios)
+    fig, axes = plt.subplots(1, n, figsize=(max(5 * n, 8), 5), squeeze=False)
+    axes = axes[0]
+    colors = get_colors(instances)
+    width = 0.8 / max(len(instances), 1)
+    x = np.arange(len(users))
+
+    for ax, scen in zip(axes, scenarios):
+        if use_line:
+            for inst in instances:
+                vals = [data.get((inst, u, scen), {}).get("avg_ms", np.nan) for u in users]
+                if all(np.isnan(vals)):
+                    continue
+                ax.plot(users, vals, marker="o", linewidth=2,
+                        label=f"{inst} inst", color=colors[inst])
+            ax.set_xscale("log")
+            ax.set_xticks(users)
+            ax.set_xticklabels([str(u) for u in users])
+            for lbl in ax.get_xticklabels():
+                lbl.set_rotation(0)
+        else:
+            for i, inst in enumerate(instances):
+                vals = [data.get((inst, u, scen), {}).get("avg_ms", np.nan) for u in users]
+                if all(np.isnan(vals)):
+                    continue
+                offset = (i - (len(instances) - 1) / 2) * width
+                bars = ax.bar(x + offset, vals, width,
+                              label=f"{inst} inst", color=colors[inst])
+                annotate(ax, bars, vals)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels([str(u) for u in users])
+        ax.set_xlabel("Usuarios")
+        ax.set_title(scen)
+        ax.grid(axis="y", linestyle="--", alpha=0.4)
+        all_vals = [data.get((i, u, scen), {}).get("avg_ms", np.nan)
+                    for i in instances for u in users]
+        if use_log or auto_scale(all_vals) == "log":
+            ax.set_yscale("log")
+
+    axes[0].set_ylabel("Tempo de resposta medio (ms)")
+    axes[0].legend(title="Instancias", loc="best")
+    fig.suptitle("Tempo de resposta medio", fontsize=14, y=1.02)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"salvo: {out_path}")
+
+
+def chart_rps(data, scenarios, instances, users, out_path, use_log=False):
+    n = len(scenarios)
+    fig, axes = plt.subplots(1, n, figsize=(max(5 * n, 8), 5), squeeze=False)
+    axes = axes[0]
+    colors = get_colors(users)
+    width = 0.8 / max(len(users), 1)
+    x = np.arange(len(instances))
+
+    for ax, scen in zip(axes, scenarios):
+        for i, u in enumerate(users):
+            vals = [data.get((inst, u, scen), {}).get("rps", np.nan) for inst in instances]
+            if all(np.isnan(vals)):
+                continue
+            offset = (i - (len(users) - 1) / 2) * width
             bars = ax.bar(x + offset, vals, width,
-                          label=f"{inst} inst", color=COLORS_INST[inst])
+                          label=f"{u} usuarios", color=colors[u])
+            annotate(ax, bars, vals, fmt="{:.1f}")
+
+        ax.set_xticks(x)
+        ax.set_xticklabels([f"{i} inst" for i in instances])
+        ax.set_xlabel("Instancias WordPress")
+        ax.set_title(scen)
+        ax.grid(axis="y", linestyle="--", alpha=0.4)
+        all_vals = [data.get((i, u, scen), {}).get("rps", np.nan)
+                    for i in instances for u in users]
+        if use_log or auto_scale(all_vals) == "log":
+            ax.set_yscale("log")
+
+    axes[0].set_ylabel("Requisicoes por segundo")
+    axes[0].legend(title="Usuarios", loc="best")
+    fig.suptitle("Throughput (RPS)", fontsize=14, y=1.02)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"salvo: {out_path}")
+
+
+def chart_failures(data, scenarios, instances, users, out_path):
+    """Barras de falhas — util para identificar teto da arquitetura."""
+    n = len(scenarios)
+    fig, axes = plt.subplots(1, n, figsize=(max(5 * n, 8), 5), squeeze=False)
+    axes = axes[0]
+    colors = get_colors(instances)
+    width = 0.8 / max(len(instances), 1)
+    x = np.arange(len(users))
+
+    for ax, scen in zip(axes, scenarios):
+        for i, inst in enumerate(instances):
+            vals = [data.get((inst, u, scen), {}).get("failures", np.nan) for u in users]
+            if all(np.isnan(vals)):
+                continue
+            offset = (i - (len(instances) - 1) / 2) * width
+            bars = ax.bar(x + offset, vals, width,
+                          label=f"{inst} inst", color=colors[inst])
             annotate(ax, bars, vals)
         ax.set_xticks(x)
-        ax.set_xticklabels([str(u) for u in USERS])
-        ax.set_xlabel("Usuários")
-        ax.set_title(scenario)
+        ax.set_xticklabels([str(u) for u in users])
+        ax.set_xlabel("Usuarios")
+        ax.set_title(scen)
         ax.grid(axis="y", linestyle="--", alpha=0.4)
-    axes[0].set_ylabel("Tempo de resposta médio (ms)")
-    axes[0].legend(title="Instâncias", loc="upper left")
-    fig.suptitle("Tempo de resposta médio — por usuários e instâncias", fontsize=14, y=1.02)
+
+    axes[0].set_ylabel("Falhas")
+    axes[0].legend(title="Instancias", loc="best")
+    fig.suptitle("Falhas por cenario", fontsize=14, y=1.02)
     plt.tight_layout()
-    out = os.path.join(OUTPUT_DIR, "response_time_by_users.png")
-    plt.savefig(out, dpi=150, bbox_inches="tight")
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
-    print(f"salvo: {out}")
+    print(f"salvo: {out_path}")
 
 
-def chart_rps(data):
-    """X = instâncias, barras por usuários, Y = requisições por segundo."""
-    fig, axes = plt.subplots(1, len(SCENARIOS), figsize=(18, 5), sharey=True)
-    width = 0.25
-    x = np.arange(len(INSTANCES))
-    for ax, scenario in zip(axes, SCENARIOS):
-        for i, u in enumerate(USERS):
-            vals = [data.get((inst, u, scenario), {}).get("rps", np.nan) for inst in INSTANCES]
-            offset = (i - (len(USERS) - 1) / 2) * width
-            bars = ax.bar(x + offset, vals, width,
-                          label=f"{u} usuários", color=COLORS_USER[u])
-            annotate(ax, bars, vals, fmt="{:.1f}")
-        ax.set_xticks(x)
-        ax.set_xticklabels([f"{i} inst" for i in INSTANCES])
-        ax.set_xlabel("Instâncias WordPress")
-        ax.set_title(scenario)
-        ax.grid(axis="y", linestyle="--", alpha=0.4)
-    axes[0].set_ylabel("Requisições por segundo (RPS)")
-    axes[0].legend(title="Usuários", loc="upper left")
-    fig.suptitle("Throughput (RPS) — por instâncias e usuários", fontsize=14, y=1.02)
-    plt.tight_layout()
-    out = os.path.join(OUTPUT_DIR, "rps_by_instances.png")
-    plt.savefig(out, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"salvo: {out}")
+def print_summary(data, scenarios, instances, users):
+    print(f"\n{'cenario':<14} {'inst':>4} {'users':>6} {'reqs':>6} {'fails':>6} {'avg_ms':>8} {'rps':>8}")
+    print("-" * 60)
+    total = 0
+    for scen in scenarios:
+        for inst in instances:
+            for u in users:
+                d = data.get((inst, u, scen))
+                if not d:
+                    print(f"{scen:<14} {inst:>4} {u:>6} {'---':>6}")
+                    continue
+                print(f"{scen:<14} {inst:>4} {u:>6} {d['requests']:>6} "
+                      f"{d['failures']:>6} {d['avg_ms']:>8.1f} {d['rps']:>8.2f}")
+                total += 1
+    expected = len(scenarios) * len(instances) * len(users)
+    print(f"\n{total}/{expected} combinacoes presentes")
+    if total < expected:
+        print("Faltando:", expected - total, "ponto(s)")
 
 
 def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    data = load_data()
+    args = parse_args()
+    os.makedirs(args.out, exist_ok=True)
+
+    data, scenarios, instances, users = discover(args.dir)
     if not data:
-        sys.exit("Nenhum CSV encontrado em " + RESULTS_DIR)
-    print(f"Carregados {len(data)} pontos.\n")
+        sys.exit(f"Nenhum CSV valido em {args.dir}")
 
-    print(f"{'cenário':<14} {'inst':>4} {'users':>6} {'reqs':>6} {'fails':>6} {'avg(ms)':>8} {'rps':>8}")
-    print("-" * 60)
-    for scenario in SCENARIOS:
-        for inst in INSTANCES:
-            for u in USERS:
-                d = data.get((inst, u, scenario))
-                if not d:
-                    print(f"{scenario:<14} {inst:>4} {u:>6} {'---':>6}")
-                    continue
-                print(f"{scenario:<14} {inst:>4} {u:>6} {d['requests']:>6} "
-                      f"{d['failures']:>6} {d['avg_ms']:>8.1f} {d['rps']:>8.2f}")
-    print()
+    print(f"Detectado: {len(scenarios)} cenario(s), "
+          f"{len(instances)} instancia(s) {instances}, "
+          f"{len(users)} usuario(s) {users}\n")
 
-    chart_response_time(data)
-    chart_rps(data)
+    print_summary(data, scenarios, instances, users)
+
+    suffix = "_log" if args.log else ""
+    suffix += "_line" if args.line else ""
+
+    chart_response_time(
+        data, scenarios, instances, users,
+        os.path.join(args.out, f"response_time{suffix}.png"),
+        use_log=args.log, use_line=args.line,
+    )
+    chart_rps(
+        data, scenarios, instances, users,
+        os.path.join(args.out, f"rps{suffix}.png"),
+        use_log=args.log,
+    )
+    chart_failures(
+        data, scenarios, instances, users,
+        os.path.join(args.out, f"failures{suffix}.png"),
+    )
 
 
 if __name__ == "__main__":

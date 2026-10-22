@@ -15,7 +15,7 @@ set /a SPAWN=%USERS% / 20
 if %SPAWN% LSS 1 set SPAWN=1
 
 echo [2/3] Locust: %USERS% usuarios (spawn %SPAWN%/s) - cenario %SCENARIO%...
-docker compose run --rm locust ^
+docker compose run --rm --no-deps locust ^
   --headless ^
   -f /mnt/locust/locustfile.py ^
   -u %USERS% -r %SPAWN% -t 2m ^
