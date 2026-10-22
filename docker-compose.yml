@@ -8,33 +8,7 @@ services:
     networks:
       - backend
 
-  wordpress1:
-    image: wordpress:5.4.2-php7.2-apache
-    environment:
-      WORDPRESS_DB_HOST: db
-      WORDPRESS_DB_PASSWORD: wp
-    volumes:
-      - ./html:/var/www/html
-    networks:
-      - backend
-      - frontend
-    depends_on:
-      - db
-
-  wordpress2:
-    image: wordpress:5.4.2-php7.2-apache
-    environment:
-      WORDPRESS_DB_HOST: db
-      WORDPRESS_DB_PASSWORD: wp
-    volumes:
-      - ./html:/var/www/html
-    networks:
-      - backend
-      - frontend
-    depends_on:
-      - db
-
-  wordpress3:
+  wordpress:
     image: wordpress:5.4.2-php7.2-apache
     environment:
       WORDPRESS_DB_HOST: db
@@ -57,9 +31,18 @@ services:
     networks:
       - frontend
     depends_on:
-      - wordpress1
-      - wordpress2
-      - wordpress3
+      - wordpress
+
+  locust:
+    image: locustio/locust
+    profiles: ["locust"]
+    volumes:
+      - ./locustfile.py:/mnt/locust/locustfile.py:ro
+      - ./locust-results:/mnt/locust/results
+    networks:
+      - frontend
+    depends_on:
+      - nginx
 
 networks:
   frontend:
