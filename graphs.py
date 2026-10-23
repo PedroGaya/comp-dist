@@ -2,7 +2,6 @@ import argparse
 import os
 import re
 import sys
-from collections import defaultdict
 
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -22,10 +21,6 @@ def parse_args():
 
 
 def discover(results_dir):
-    """Escaneia CSVs e devolve dict {(inst, users, scenario): metrics}."""
-    if not os.path.isdir(results_dir):
-        sys.exit(f"Diretorio nao encontrado: {results_dir}")
-
     data = {}
     scenarios, instances, users = set(), set(), set()
 
@@ -71,7 +66,6 @@ def discover(results_dir):
 
 
 def auto_scale(values):
-    """Sugere 'log' se a razao max/min passar de 20x."""
     vals = [v for v in values if not np.isnan(v) and v > 0]
     if len(vals) < 2:
         return "linear"
@@ -182,7 +176,6 @@ def chart_rps(data, scenarios, instances, users, out_path, use_log=False):
 
 
 def chart_failures(data, scenarios, instances, users, out_path):
-    """Barras de falhas — util para identificar teto da arquitetura."""
     n = len(scenarios)
     fig, axes = plt.subplots(1, n, figsize=(max(5 * n, 8), 5), squeeze=False)
     axes = axes[0]
